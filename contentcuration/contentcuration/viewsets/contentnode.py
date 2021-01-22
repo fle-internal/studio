@@ -27,7 +27,6 @@ from rest_framework.serializers import ChoiceField
 from rest_framework.serializers import DictField
 from rest_framework.serializers import IntegerField
 from rest_framework.serializers import ValidationError
-from rest_framework.viewsets import ViewSet
 
 from contentcuration.db.models.expressions import IsNull
 from contentcuration.db.models.query import RIGHT_JOIN
@@ -351,7 +350,8 @@ def get_title(item):
     return item["title"] if item["parent_id"] else item["original_channel_name"]
 
 
-class PrerequisitesUpdateHandler(ViewSet):
+class PrerequisitesUpdateHandler(ValuesViewset):
+    values = tuple()
     """
     Dummy viewset for handling create and delete changes for prerequisites
     """

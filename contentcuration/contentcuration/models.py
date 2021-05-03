@@ -18,6 +18,7 @@ from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.auth.base_user import BaseUserManager
 from django.contrib.auth.models import PermissionsMixin
 from django.contrib.postgres.fields import JSONField
+from django.contrib.sessions.models import Session
 from django.core.cache import cache
 from django.core.exceptions import MultipleObjectsReturned
 from django.core.exceptions import ObjectDoesNotExist
@@ -59,6 +60,7 @@ from mptt.models import TreeForeignKey
 from postmark.core import PMMailInactiveRecipientException
 from postmark.core import PMMailUnauthorizedException
 from rest_framework.authtoken.models import Token
+from rest_framework.utils.encoders import JSONEncoder
 
 from contentcuration.db.models.expressions import Array
 from contentcuration.db.models.functions import Unnest
@@ -68,6 +70,8 @@ from contentcuration.db.models.manager import CustomContentNodeTreeManager
 from contentcuration.statistics import record_channel_stats
 from contentcuration.utils.cache import delete_public_channel_cache_keys
 from contentcuration.utils.parser import load_json_string
+from contentcuration.viewsets.sync.constants import ALL_CHANGES
+from contentcuration.viewsets.sync.constants import ALL_TABLES
 
 
 EDIT_ACCESS = "edit"
@@ -2199,3 +2203,72 @@ class Task(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, related_name="task")
     metadata = JSONField()
     channel_id = DjangoUUIDField(db_index=True, null=True, blank=True)
+
+
+class Change(models.Model):
+    server_rev = models.BigAutoField(primary_key=True)
+    # We need to store the user who is applying this change
+    # so that we can validate they have permissions to do so
+    # allow to be null so that we don't lose changes if a user
+    # account is hard deleted.
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name="changes_by_user")
+    # Almost all changes are related to channels, but some are specific only to users
+    # so we allow this to be nullable for these edge cases.
+    channel = models.ForeignKey(Channel, null=True, blank=True, on_delete=models.CASCADE)
+    # For those changes related to users, store a user value instead of channel
+    # this may be different to created_by, as changes to invitations affect individual users
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE, related_name="changes_about_user")
+    # Use client_rev to keep track of changes coming from the client side
+    # but let it be blank or null for changes we generate on the server side
+    client_rev = models.IntegerField(null=True, blank=True)
+    # client_rev numbers are by session, we add the session key here for bookkeeping
+    # to allow a check within the same session to return whether a change has been applied
+    # or not, and hence remove it from the frontend
+    session = models.ForeignKey(Session, null=True, blank=True, on_delete=models.SET_NULL)
+    table = models.CharField(max_length=32)
+    change_type = models.IntegerField()
+    # Use the DRF JSONEncoder class as the encoder here
+    # so that we can handle anything that has been deserialized by DRF
+    # or that will be later be serialized by DRF
+    kwargs = JSONField(encoder=JSONEncoder)
+    applied = models.BooleanField(default=False)
+    errored = models.BooleanField(default=False)
+
+    @classmethod
+    def _create_from_change(cls, created_by_id=None, channel_id=None, user_id=None, session_key=None, applied=False, table=None, rev=None, **data):
+        change_type = data.pop("type")
+        if table is None or table not in ALL_TABLES:
+            raise TypeError("table is a required argument for creating changes and must be a valid table name")
+        if change_type is None or change_type not in ALL_CHANGES:
+            raise TypeError("change_type is a required argument for creating changes and must be a valid change type integer")
+        return cls(
+            session_id=session_key,
+            created_by_id=created_by_id,
+            channel_id=channel_id,
+            user_id=user_id,
+            client_rev=rev,
+            table=table,
+            change_type=change_type,
+            kwargs=data,
+            applied=applied
+        )
+
+    @classmethod
+    def create_changes(cls, changes, created_by_id=None, session_key=None, applied=False):
+        change_models = []
+        for change in changes:
+            change_models.append(cls._create_from_change(created_by_id=created_by_id, session_key=session_key, applied=applied, **change))
+
+        cls.objects.bulk_create(change_models)
+        return change_models
+
+    @classmethod
+    def create_change(cls, change, created_by_id=None, session_key=None, applied=False):
+        obj = cls._create_from_change(created_by_id=created_by_id, session_key=session_key, applied=applied, **change)
+        obj.save()
+        return obj
+
+    def serialize_to_change_dict(self):
+        datum = self.kwargs
+        datum.update({"rev": self.client_rev, "table": self.table, "type": self.change_type})
+        return datum

@@ -51,7 +51,7 @@ logging = logmodule.getLogger(__name__)
 PERSEUS_IMG_DIR = exercises.IMG_PLACEHOLDER + "/images"
 THUMBNAIL_DIMENSION = 128
 MIN_SCHEMA_VERSION = "1"
-BLOCKING_TASK_TYPES = ["duplicate-nodes", "move-nodes", "sync-channel"]
+BLOCKING_TASK_TYPES = ["duplicate-nodes", "sync-channel"]
 
 
 def send_emails(channel, user_id, version_notes=''):

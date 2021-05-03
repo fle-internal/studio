@@ -34,6 +34,7 @@ export const MESSAGES = {
   FETCH_COLLECTION: 'FETCH_COLLECTION',
   FETCH_MODEL: 'FETCH_MODEL',
   REQUEST_RESPONSE: 'REQUEST_RESPONSE',
+  SYNC_CHANNEL: 'SYNC_CHANNEL',
 };
 
 export const STATUS = {
@@ -68,3 +69,5 @@ export const TASK_ID = '__TASK_ID';
 // This constant is used for saving/retrieving a current
 // user object from the session table
 export const CURRENT_USER = 'CURRENT_USER';
+
+export const CHANNEL_SYNC_KEEP_ALIVE_INTERVAL = 300 * 1000;

@@ -1063,6 +1063,27 @@ NODE_MODIFIED_INDEX_NAME = "node_modified_idx"
 NODE_MODIFIED_DESC_INDEX_NAME = "node_modified_desc_idx"
 
 
+class ContentMetadata(MPTTModel, models.Model):
+    id = UUIDField(primary_key=True, default=uuid.uuid4)
+    metadata_name = models.CharField(max_length=150)
+    parent = TreeForeignKey(
+        "self", null=True, blank=True, related_name="children", db_index=True
+    )
+
+    def breadcrumb(self):
+        family = self.get_family()
+        return ' > '.join([m.metadata_name for m in family])
+
+    @classmethod
+    def meta_descendants(cls, metadata_name):
+        return cls.objects.get(metadata_name=metadata_name).get_descendants(
+            include_self=True
+        )
+
+    def __str__(self):
+        return self.metadata_name
+
+
 class ContentNode(MPTTModel, models.Model):
     """
     By default, all nodes have a title and can be used as a topic.
@@ -1104,6 +1125,9 @@ class ContentNode(MPTTModel, models.Model):
     language = models.ForeignKey('Language', null=True, blank=True, related_name='content_language')
     parent = TreeForeignKey('self', null=True, blank=True, related_name='children', db_index=True)
     tags = models.ManyToManyField(ContentTag, symmetrical=False, related_name='tagged_content', blank=True)
+    metadata = models.ManyToManyField(
+        ContentMetadata, symmetrical=False, related_name="metadata_content", blank=True
+    )
     # No longer used
     sort_order = models.FloatField(max_length=50, default=1, verbose_name="sort order",
                                    help_text="Ascending, lowest number shown first")
@@ -1216,6 +1240,11 @@ class ContentNode(MPTTModel, models.Model):
             | Q(public=True)
             | Q(tree_id=cls._orphan_tree_id_subquery())
         )
+
+    @classmethod
+    def filter_metadata_queryset(cls, queryset, tags):
+        metadata = ContentMetadata.objects.filter(metadata_name__in=tags)
+        return queryset.filter(metadata__in=metadata)
 
     @raise_if_unsaved
     def get_root(self):

@@ -17,6 +17,7 @@ from django.conf import settings
 from django.contrib.auth.base_user import AbstractBaseUser
 from django.contrib.auth.base_user import BaseUserManager
 from django.contrib.auth.models import PermissionsMixin
+from django.contrib.postgres.aggregates import ArrayAgg
 from django.contrib.postgres.fields import JSONField
 from django.core.cache import cache
 from django.core.exceptions import MultipleObjectsReturned
@@ -1063,6 +1064,38 @@ NODE_MODIFIED_INDEX_NAME = "node_modified_idx"
 NODE_MODIFIED_DESC_INDEX_NAME = "node_modified_desc_idx"
 
 
+class ContentMetadata(MPTTModel, models.Model):
+    id = UUIDField(primary_key=True, default=uuid.uuid4)
+    metadata_name = models.CharField(max_length=150)
+    node_ids = JSONField(default=[])
+    parent = TreeForeignKey(
+        "self", null=True, blank=True, related_name="children", db_index=True
+    )
+
+    def breadcrumb(self):
+        family = self.get_family()
+        return ' > '.join([m.metadata_name for m in family])
+
+    @classmethod
+    def meta_descendants(cls, metadata_name):
+        return cls.objects.get(metadata_name=metadata_name).get_descendants(
+            include_self=True
+        )
+
+    def nodes_metadata(self, descendants=False):
+        nodes = self.node_ids
+        if descendants:
+            meta_descendants = self.get_descendants(include_self=False).values(
+                "node_ids"
+            )
+            for meta in meta_descendants:
+                nodes += meta["node_ids"]
+        return set(nodes)
+
+    def __str__(self):
+        return self.metadata_name
+
+
 class ContentNode(MPTTModel, models.Model):
     """
     By default, all nodes have a title and can be used as a topic.
@@ -1104,6 +1137,7 @@ class ContentNode(MPTTModel, models.Model):
     language = models.ForeignKey('Language', null=True, blank=True, related_name='content_language')
     parent = TreeForeignKey('self', null=True, blank=True, related_name='children', db_index=True)
     tags = models.ManyToManyField(ContentTag, symmetrical=False, related_name='tagged_content', blank=True)
+    metadata = JSONField(default=[])
     # No longer used
     sort_order = models.FloatField(max_length=50, default=1, verbose_name="sort order",
                                    help_text="Ascending, lowest number shown first")
@@ -1217,6 +1251,31 @@ class ContentNode(MPTTModel, models.Model):
             | Q(tree_id=cls._orphan_tree_id_subquery())
         )
 
+    @classmethod
+    def filter_metadata_queryset(cls, queryset, tags):
+        metadata = ContentMetadata.objects.filter(metadata_name__in=tags).aggregate(
+            nodes=ArrayAgg("node_ids")
+        )
+        nodes = set(metadata["nodes"][0]) if metadata["nodes"] else []
+        return queryset.filter(id__in=nodes)
+
+    @classmethod
+    def unique_metatags(cls, queryset, distinct=True, level=None, parent_tag=None):
+        nodes = []
+        for tags in queryset.values("metadata"):
+            nodes += tags['metadata']
+        metadata_nodes = set(nodes)
+
+        filters = Q(id__in=metadata_nodes)
+        if level:
+            filters = filters & Q(level=level)
+        if parent_tag:
+            if type(parent_tag) is not ContentMetadata:
+                parent_tag = ContentMetadata.objects.get(metadata_name=parent_tag)
+            filters = filters & Q(id__in=parent_tag.get_descendants(include_self=True))
+        tags = ContentMetadata.objects.filter(filters)
+        return tags
+
     @raise_if_unsaved
     def get_root(self):
         # Only topics can be root nodes
@@ -1234,6 +1293,31 @@ class ContentNode(MPTTModel, models.Model):
             tree_id=self._mpttfield('tree_id'),
             parent=None,
         )
+
+    def _check_metadata_tag(self, tag):
+        if type(tag) is not ContentMetadata:
+            tag = ContentMetadata.objects.get(metadata_name=tag)
+
+        if tag is None:
+            raise ValueError("Metadata tag `{}` not found.".format(tag))
+
+        return tag
+
+    def add_metadata_tag(self, tag):
+        tag = self._check_metadata_tag(tag)
+        if tag.id not in self.metadata:
+            self.metadata.append(tag.id)
+            if self.id not in tag.node_ids:
+                tag.node_ids.append(self.id)
+                tag.save()
+            self.save()  # to avoid inconsistency with saved tags
+
+    def remove_metadata_tag(self, tag):
+        tag = self._check_metadata_tag(tag)
+        if tag.id in self.metadata:
+            self.metadata.remove(tag.id)
+            if self.id in tag.node_ids:
+                tag.node_ids.remove(self.id)
 
     def get_tree_data(self, levels=float('inf')):
         """

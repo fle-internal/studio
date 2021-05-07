@@ -19,7 +19,7 @@ import ActionLink from 'shared/views/ActionLink';
 import Menu from 'shared/views/Menu';
 import { initializeDB, resetDB } from 'shared/data';
 import { CURRENT_USER } from 'shared/data/constants';
-import { Session } from 'shared/data/resources';
+import { Session, injectVuexStore } from 'shared/data/resources';
 
 // just say yes to devtools (in debug mode)
 if (process.env.NODE_ENV !== 'production') {
@@ -102,7 +102,7 @@ export default async function startApp({ store, router, index }) {
   await i18nSetup();
 
   const currentUser = window.user || {};
-  const dbCurrentUser = (await Session.get(CURRENT_USER)) || {};
+  const dbCurrentUser = (await Session.getSession()) || {};
 
   if (
     dbCurrentUser.id !== undefined &&
@@ -114,6 +114,8 @@ export default async function startApp({ store, router, index }) {
   if (currentUser.id !== undefined && currentUser.id !== null) {
     await store.dispatch('saveSession', currentUser, { root: true });
   }
+
+  await Session.setChannelScope();
 
   const config = {
     el: 'app',
@@ -136,6 +138,10 @@ export default async function startApp({ store, router, index }) {
       e.returnValue = '';
     }
   });
+
+  // Provide access to the Store in the resource module to allow non-indexedDB access
+  // to the session state.
+  injectVuexStore(store);
 
   rootVue = new Vue(config);
 }

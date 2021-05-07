@@ -25,10 +25,11 @@ import {
   COPYING_FLAG,
   TASK_ID,
   CURRENT_USER,
+  CHANNEL_SYNC_KEEP_ALIVE_INTERVAL,
 } from './constants';
 import applyChanges, { applyMods, collectChanges } from './applyRemoteChanges';
 import mergeAllChanges from './mergeChanges';
-import db, { CLIENTID, Collection } from './db';
+import db, { channelScope, CLIENTID, Collection } from './db';
 import { API_RESOURCES, INDEXEDDB_RESOURCES } from './registry';
 import { fileErrors, NEW_OBJECT } from 'shared/constants';
 import client, { paramsSerializer } from 'shared/client';
@@ -53,6 +54,12 @@ const SUFFIX_SEPERATOR = '__';
 const validPositions = new Set(Object.values(RELATIVE_TREE_POSITIONS));
 
 const EMPTY_ARRAY = Symbol('EMPTY_ARRAY');
+
+let vuexStore;
+
+export function injectVuexStore(store) {
+  vuexStore = store;
+}
 
 // Custom uuid4 function to match our dashless uuids on the server side
 export function uuid4() {
@@ -223,8 +230,12 @@ class IndexedDBResource {
    * in a way that doesn't trigger listeners from the client that
    * initiated it by setting the CLIENTID.
    */
-  transaction({ mode = 'rw', source = CLIENTID } = {}, ...extraTables) {
+  transaction({ mode = 'rw', source = null } = {}, ...extraTables) {
     const callback = extraTables.pop();
+    if (source === null) {
+      const channelScopeId = channelScope.id;
+      source = channelScopeId === null ? CLIENTID : `${CLIENTID}::${channelScopeId}`;
+    }
     return db.transaction(mode, this.tableName, ...extraTables, () => {
       Dexie.currentTransaction.source = source;
       return callback();
@@ -534,6 +545,26 @@ class IndexedDBResource {
       return this.table.delete(id);
     });
   }
+
+  /**
+   * Set the channel_id property on a change
+   * object before we put it in the store, if relevant
+   * @param {Object} change
+   * @returns {Object}
+   */
+  setChannelIdOnChange(change) {
+    return change;
+  }
+
+  /**
+   * Set the user_id property on a change
+   * object before we put it in the store, if relevant
+   * @param {Object} change
+   * @returns {Object}
+   */
+  setUserIdOnChange(change) {
+    return change;
+  }
 }
 
 class Resource extends mix(APIResource, IndexedDBResource) {
@@ -785,6 +816,12 @@ export class TreeResource extends Resource {
   }
 }
 
+
+function channelSyncKeepAlive(channelId) {
+  document.hasFocus() ? channel.postMessage({ type: MESSAGES.SYNC_CHANNEL, channelId }) : null;
+}
+
+
 export const Session = new IndexedDBResource({
   tableName: TABLE_NAMES.SESSION,
   idField: CURRENT_USER,
@@ -796,6 +833,27 @@ export const Session = new IndexedDBResource({
       }
     },
   },
+  setChannelScope() {
+    const channelId = (window.CHANNEL_EDIT_GLOBAL || {}).channel_id || null;
+    if (channelId) {
+      channelScope.id = channelId;
+      channelSyncKeepAlive(channelId);
+      setInterval(() => channelSyncKeepAlive(channelId), CHANNEL_SYNC_KEEP_ALIVE_INTERVAL);
+      window.addEventListener('focus', () => channelSyncKeepAlive(channelId));
+    }
+  },
+  async getSession() {
+    return this.get(CURRENT_USER)
+  },
+  async updateSession(currentUser) {
+    const result = await this.update(CURRENT_USER, currentUser);
+    if (!result) {
+      await this.put({
+        ...currentUser,
+        CURRENT_USER,
+      });
+    }
+  }
 });
 
 export const Channel = new Resource({
@@ -900,7 +958,18 @@ export const Channel = new Resource({
       return client.patch(modelUrl, { deleted: true });
     });
   },
+  setChannelIdOnChange(change) {
+    // For channels, the appropriate channel_id for a change is just the key
+    change.channel_id = change.key;
+  },
 });
+
+function setChannelIdFromTransactionSource(change) {
+  const channel_id = change.source.split('::').slice(1)[0];
+  if (channel_id) {
+    change.channel_id = channel_id;
+  }
+}
 
 export const ContentNodePrerequisite = new IndexedDBResource({
   tableName: TABLE_NAMES.CONTENTNODE_PREREQUISITE,
@@ -908,6 +977,7 @@ export const ContentNodePrerequisite = new IndexedDBResource({
   idField: '[target_node+prerequisite]',
   uuid: false,
   syncable: true,
+  setChannelIdOnChange: setChannelIdFromTransactionSource,
 });
 
 export const ContentNode = new TreeResource({
@@ -1240,6 +1310,7 @@ export const ContentNode = new TreeResource({
       return node;
     });
   },
+  setChannelIdOnChange: setChannelIdFromTransactionSource,
 });
 
 export const ChannelSet = new Resource({
@@ -1259,6 +1330,12 @@ export const Invitation = new Resource({
         return this.table.update(id, changes);
       });
     });
+  },
+  setChannelIdOnChange(change) {
+    change.channel_id = change.obj.channel;
+  },
+  setUserIdOnChange(change) {
+    change.user_id = change.obj.invited;
   },
 });
 
@@ -1294,6 +1371,12 @@ export const EditorM2M = new IndexedDBResource({
   idField: '[user+channel]',
   uuid: false,
   syncable: true,
+  setChannelIdOnChange(change) {
+    change.channel_id = change.obj.channel;
+  },
+  setUserIdOnChange(change) {
+    change.user_id = change.obj.user;
+  },
 });
 
 export const ViewerM2M = new IndexedDBResource({
@@ -1302,6 +1385,12 @@ export const ViewerM2M = new IndexedDBResource({
   idField: '[user+channel]',
   uuid: false,
   syncable: true,
+  setChannelIdOnChange(change) {
+    change.channel_id = change.obj.channel;
+  },
+  setUserIdOnChange(change) {
+    change.user_id = change.obj.user;
+  },
 });
 
 export const ChannelUser = new APIResource({
@@ -1448,6 +1537,7 @@ export const AssessmentItem = new Resource({
       });
     });
   },
+  setChannelIdOnChange: setChannelIdFromTransactionSource,
 });
 
 export const File = new Resource({
@@ -1475,6 +1565,7 @@ export const File = new Resource({
         });
       });
   },
+  setChannelIdOnChange: setChannelIdFromTransactionSource,
 });
 
 export const Clipboard = new TreeResource({
@@ -1526,23 +1617,12 @@ export const Clipboard = new TreeResource({
       });
     });
   },
+  setUserIdOnChange(change) {
+    if (vuexStore) {
+      change.user_id = vuexStore.getters.currentUserId;
+    }
+  }
 });
-
-function deleteMoveTasks(change) {
-  if (change.obj.status === 'SUCCESS' || change.obj.status === 'FAILED') {
-    if (change.obj.task_type === 'move-nodes') {
-      Task.delete(change.key);
-    }
-  }
-}
-
-function deleteDeleteNodeTasks(change) {
-  if (change.obj.status === 'SUCCESS' || change.obj.status === 'FAILED') {
-    if (change.obj.task_type === 'delete-node') {
-      Task.delete(change.key);
-    }
-  }
-}
 
 export const Task = new Resource({
   tableName: TABLE_NAMES.TASK,
@@ -1556,8 +1636,6 @@ export const Task = new Resource({
           applyChanges(changes);
         }
       }
-      deleteMoveTasks(change);
-      deleteDeleteNodeTasks(change);
     },
     [CHANGE_TYPES.UPDATED]: function(change) {
       if (change.mods.status === 'SUCCESS') {
@@ -1566,8 +1644,10 @@ export const Task = new Resource({
           applyChanges(changes);
         }
       }
-      deleteMoveTasks(change);
-      deleteDeleteNodeTasks(change);
     },
+  },
+  setChannelIdOnChange(change) {
+    // For channels, the appropriate channel_id for a change is just the key
+    change.channel_id = change.obj.channel_id;
   },
 });

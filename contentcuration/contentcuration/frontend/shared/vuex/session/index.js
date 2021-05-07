@@ -96,10 +96,7 @@ export default {
   },
   actions: {
     async saveSession(context, currentUser) {
-      await Session.put({
-        ...currentUser,
-        CURRENT_USER,
-      });
+      Session.updateSession(currentUser);
       context.commit('ADD_SESSION', currentUser);
     },
     login(context, credentials) {

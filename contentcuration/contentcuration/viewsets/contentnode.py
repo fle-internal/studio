@@ -27,7 +27,6 @@ from rest_framework.serializers import ChoiceField
 from rest_framework.serializers import DictField
 from rest_framework.serializers import IntegerField
 from rest_framework.serializers import ValidationError
-from rest_framework.viewsets import ViewSet
 
 from contentcuration.db.models.expressions import IsNull
 from contentcuration.db.models.query import RIGHT_JOIN
@@ -41,7 +40,6 @@ from contentcuration.models import File
 from contentcuration.models import generate_storage_url
 from contentcuration.models import PrerequisiteContentRelationship
 from contentcuration.models import UUIDField
-from contentcuration.tasks import create_async_task
 from contentcuration.tasks import get_or_create_async_task
 from contentcuration.utils.nodes import calculate_resource_size
 from contentcuration.viewsets.base import BulkListSerializer
@@ -62,7 +60,6 @@ from contentcuration.viewsets.sync.constants import DELETED
 from contentcuration.viewsets.sync.constants import TASK_ID
 from contentcuration.viewsets.sync.utils import generate_delete_event
 from contentcuration.viewsets.sync.utils import generate_update_event
-from contentcuration.viewsets.sync.utils import log_sync_exception
 
 
 channel_query = Channel.objects.filter(main_tree__tree_id=OuterRef("tree_id"))
@@ -356,7 +353,8 @@ def get_title(item):
     return item["title"] if item["parent_id"] else item["original_channel_name"]
 
 
-class PrerequisitesUpdateHandler(ViewSet):
+class PrerequisitesUpdateHandler(ValuesViewset):
+    values = tuple()
     """
     Dummy viewset for handling create and delete changes for prerequisites
     """
@@ -770,18 +768,9 @@ class ContentNodeViewSet(BulkUpdateMixin, ChangeEventMixin, ValuesViewset):
         try:
             target, position = self.validate_targeting_args(target, position)
 
-            channel_id = target.channel_id
-
-            task_args = {
-                "user_id": self.request.user.id,
-                "channel_id": channel_id,
-                "node_id": contentnode.id,
-                "target_id": target.id,
-                "position": position,
-            }
-
-            task, task_info = create_async_task(
-                "move-nodes", self.request.user, **task_args
+            contentnode.move_to(
+                target,
+                position,
             )
 
             return (
@@ -815,6 +804,7 @@ class ContentNodeViewSet(BulkUpdateMixin, ChangeEventMixin, ValuesViewset):
         excluded_descendants=None,
         **kwargs
     ):
+        from contentcuration.tasks import create_async_task
         try:
             target, position = self.validate_targeting_args(target, position)
         except ValidationError as e:
@@ -852,30 +842,3 @@ class ContentNodeViewSet(BulkUpdateMixin, ChangeEventMixin, ValuesViewset):
             None,
             [generate_update_event(pk, CONTENTNODE, {TASK_ID: task_info.task_id})],
         )
-
-    def delete_from_changes(self, changes):
-        errors = []
-        changes_to_return = []
-        queryset = self.get_edit_queryset().order_by()
-        for change in changes:
-            try:
-                instance = queryset.get(**dict(self.values_from_key(change["key"])))
-
-                task_args = {
-                    "user_id": self.request.user.id,
-                    "channel_id": instance.channel_id,
-                    "node_id": instance.id,
-                }
-
-                task, task_info = create_async_task(
-                    "delete-node", self.request.user, **task_args
-                )
-            except ContentNode.DoesNotExist:
-                # If the object already doesn't exist, as far as the user is concerned
-                # job done!
-                pass
-            except Exception as e:
-                log_sync_exception(e)
-                change["errors"] = [str(e)]
-                errors.append(change)
-        return errors, changes_to_return

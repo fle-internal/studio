@@ -11,19 +11,21 @@ import {
   IGNORED_SOURCE,
   MESSAGES,
   STATUS,
+  CHANNEL_SYNC_KEEP_ALIVE_INTERVAL,
 } from './constants';
 import db from './db';
 import mergeAllChanges from './mergeChanges';
 import { API_RESOURCES, INDEXEDDB_RESOURCES } from './registry';
+import { Session } from './resources';
 import client from 'shared/client';
 import urls from 'shared/urls';
-
-// Number of changes to process at once
-const SYNC_BUFFER = 1000;
 
 // When this many seconds pass without a syncable
 // change being registered, sync changes!
 const SYNC_IF_NO_CHANGES_FOR = 2;
+
+// Interval at which to check for new changes
+const SYNC_INTERVAL = 5;
 
 // In order to listen to messages being sent
 // by all windows, including this one, for requests
@@ -95,6 +97,22 @@ function stopChannelFetchListener() {
   channel.removeEventListener('message', handleFetchMessages);
 }
 
+const channelsToSync = {};
+
+function handleChannelSyncMessages(msg) {
+  if (msg.type === MESSAGES.SYNC_CHANNEL && msg.channelId) {
+    channelsToSync[msg.channelId] = Date.now();
+  }
+}
+
+function startChannelSyncListener() {
+  channel.addEventListener('message', handleChannelSyncMessages);
+}
+
+function stopChannelSyncListener() {
+  channel.removeEventListener('message', handleChannelSyncMessages);
+}
+
 function isSyncableChange(change) {
   const src = change.source || '';
 
@@ -112,7 +130,7 @@ function applyResourceListener(change) {
   }
 }
 
-const commonFields = ['type', 'key', 'table', 'rev'];
+const commonFields = ['type', 'key', 'table', 'rev', 'channel_id', 'user_id'];
 const createFields = commonFields.concat(['obj']);
 const updateFields = commonFields.concat(['mods']);
 const movedFields = commonFields.concat(['target', 'position']);
@@ -138,7 +156,92 @@ function trimChangeForSync(change) {
   }
 }
 
-function syncChanges() {
+function handleDisallowed(response) {
+  // The disallowed property is an array of any changes that were sent to the server,
+  // that were rejected.
+  const disallowed = get(response, ['data', 'disallowed'], []);
+  if (disallowed.length) {
+    // Collect all disallowed
+    const disallowedRevs = disallowed.map(d => d.rev);
+    // Set the return error data onto the changes - this will update the change
+    // both with any errors and the results of any merging that happened prior
+    // to the sync operation being called
+    return db[CHANGES_TABLE].where('rev')
+      .anyOf(disallowedRevs.map(Number))
+      .modify({ disallowed: true, synced: true });
+  }
+  return Promise.resolve();
+}
+
+function handleAllowed(response) {
+  // The allowed property is an array of any rev and server_rev for any changes sent to
+  // the server that were accepted
+  const allowed = get(response, ['data', 'allowed'], []);
+  if (allowed.length) {
+    const revMap = {};
+    for (let obj of allowed) {
+      revMap[obj.rev] = obj.server_rev;
+    }
+    return db[CHANGES_TABLE].where('rev')
+      .anyOf(Object.keys(revMap).map(Number))
+      .modify(c => {
+        c.server_rev = revMap[c.rev];
+        c.synced = true;
+      });
+  }
+  return Promise.resolve();
+}
+
+function handleReturnedChanges(response) {
+  // The changes property is an array of any changes from the server to apply in the
+  // client.
+  const returnedChanges = get(response, ['data', 'changes'], []);
+  if (returnedChanges.length) {
+    return applyChanges(returnedChanges);
+  }
+  return Promise.resolve();
+}
+
+function handleErrors(response) {
+  // The errors property is an array of any changes that were sent to the server,
+  // that were rejected, with an additional errors property that describes
+  // the error.
+  const errors = get(response, ['data', 'errors'], []);
+  if (errors.length) {
+    const errorMap = {};
+    for (let error of errors) {
+      errorMap[error.rev] = error;
+    }
+    // Set the return error data onto the changes - this will update the change
+    // both with any errors and the results of any merging that happened prior
+    // to the sync operation being called
+    return db[CHANGES_TABLE].where('rev')
+      .anyOf(Object.keys(errorMap).map(Number))
+      .modify(obj => {
+        return Object.assign(obj, errorMap[obj.rev]);
+      });
+  }
+  return Promise.resolve();
+}
+
+function handleSuccesses(response) {
+  // The successes property is an array of server_revs for any previously synced changes
+  // that have now been successfully applied on the server.
+  const successes = get(response, ['data', 'successes'], []);
+  if (successes.length) {
+    return db[CHANGES_TABLE].where('server_rev')
+      .anyOf(successes)
+      .delete();
+  }
+  return Promise.resolve();
+}
+
+function handleMaxRev(response) {
+  const max_rev = response.data.max_rev;
+  return Session.updateSession({ max_rev });
+}
+
+async function syncChanges() {
   // Note: we could in theory use Dexie syncable for what
   // we are doing here, but I can't find a good way to make
   // it ignore our regular API calls for seeding the database
@@ -154,141 +257,72 @@ function syncChanges() {
   // might have come in during processing - leave them for the next cycle.
   // This is the primary key of the change objects, so the collection is ordered by this
   // by default - if we just grab the last object, we can get the key from there.
-  return db[CHANGES_TABLE].orderBy('rev')
-    .last()
-    .then(lastChange => {
-      let changesPromise = Promise.resolve([]);
-      let changesMaxRevision;
-      if (lastChange) {
-        changesMaxRevision = lastChange.rev;
-        const syncableChanges = db[CHANGES_TABLE].where('rev').belowOrEqual(changesMaxRevision);
-        changesPromise = syncableChanges.count(count => {
-          let i = 0;
-          function processNextChunk(changesToSync) {
-            // If our starting point plus the SYNC_BUFFER value
-            // is greater than or equal to the count, then this
-            // is our final recursion through.
-            const finalRecursion = i + SYNC_BUFFER >= count;
-            return syncableChanges
-              .offset(i)
-              .limit(SYNC_BUFFER)
-              .sortBy('rev')
-              .then(changes => {
-                // Continue to merge on to the existing changes we have merged
-                changesToSync = mergeAllChanges(changes, finalRecursion, changesToSync);
-                // Check that we have not got all of the records in this last pass
-                if (!finalRecursion) {
-                  // We've handled all the changes in this chunk,
-                  // so now let's increment and do the next one.
-                  i += SYNC_BUFFER;
-                  return processNextChunk(changesToSync);
-                } else {
-                  return changesToSync;
-                }
-              });
-          }
-          return processNextChunk();
-        });
-      }
-      return changesPromise.then(changesToSync => {
-        // By the time we get here, our changesToSync Array should
-        // have every change we want to sync to the server, so we
-        // can now trim it down to only what is needed to transmit over the wire.
-        // TODO: remove moves when a delete change is present for an object,
-        // because a delete will wipe out the move.
-        const changes = changesToSync.map(trimChangeForSync);
-        // Create a promise for the sync - if there is nothing to sync just resolve immediately,
-        // in order to still call our change cleanup code.
-        const syncPromise = changes.length
-          ? client.post(urls['sync'](), changes, { timeout: 10 * 1000 })
-          : Promise.resolve({});
-        // TODO: Log validation errors from the server somewhere for use in the frontend.
-        let allErrors = false;
-        return syncPromise
-          .catch(err => {
-            // If all of the changes synced respond with errors,
-            // then the backend will respond with a 400 status code
-            // in order to do meaningful processing on the errors,
-            // we check here first what kind of error was returned
-            // if it is a 400, then we can pass the response object
-            // to the main handler function in order to process the errors
-            const status = get(err, ['response', 'status'], null);
-            if (status === 400) {
-              const errors = get(err, ['response', 'data', 'errors'], null);
-              if (errors) {
-                allErrors = true;
-                return err.response;
-              }
-            }
-            return Promise.reject(err);
-          })
-          .then(response => {
-            // The response from the sync endpoint has the format:
-            // {
-            //    "changes": [],
-            //    "errors": [],
-            // }
-            // The changes property is an array of any changes from the server to apply in the
-            // client.
-            // The errors property is an array of any changes that were sent to the server,
-            // that were rejected, with an additional errors property that describes
-            // the error.
-            const returnedChanges = get(response, ['data', 'changes'], []);
-            const errors = get(response, ['data', 'errors'], []);
-            // Collect all errors into an errorMap
-            const errorMap = {};
-            let errorSetPromise = Promise.resolve();
-            if (errors.length) {
-              for (let error of errors) {
-                errorMap[error.rev] = error;
-              }
-              // Set the return error data onto the changes - this will update the change
-              // both with any errors and the results of any merging that happened prior
-              // to the sync operation being called
-              errorSetPromise = db[CHANGES_TABLE].where('rev')
-                .anyOf(Object.keys(errorMap).map(Number))
-                .modify(obj => {
-                  return Object.assign(obj, errorMap[obj.rev]);
-                });
-            }
-            let changesToDelete;
-            if (!allErrors) {
-              changesToDelete = db[CHANGES_TABLE].where('rev').belowOrEqual(changesMaxRevision);
-              if (errors.length) {
-                // Filter changes by whether the revision for this change is in the errorMap
-                // merged changes will have been returned from the server whole, so deleting
-                // older changes will not be a problem here, as we maintain the merged
-                // representation
-                changesToDelete = changesToDelete.filter(change => !errorMap[change.rev]);
-              }
-            }
-            const deleteChangesPromise =
-              lastChange && !allErrors ? changesToDelete.delete() : Promise.resolve();
-            const returnedChangesPromise = returnedChanges.length
-              ? applyChanges(returnedChanges)
-              : Promise.resolve();
-            // Our synchronization was successful,
-            // can delete all the changes for this table
-            return Promise.all([
-              deleteChangesPromise,
-              returnedChangesPromise,
-              errorSetPromise,
-            ]).catch(() => {
-              console.error('There was an error deleting changes'); // eslint-disable-line no-console
-            });
-          })
-          .catch(err => {
-            // There was an error during syncing, log, but carry on
-            console.warn('There was an error during syncing with the backend for', err); // eslint-disable-line no-console
-          });
-      });
-    })
-    .then(() => {
-      syncActive = false;
-    })
-    .catch(() => {
-      syncActive = false;
-    });
+  const [lastChange, earliestServerChange, user] = await Promise.all([
+    db[CHANGES_TABLE].orderBy('rev').last(),
+    db[CHANGES_TABLE].orderBy('server_rev').first(),
+    Session.getSession(),
+  ]);
+  if (!user) {
+    // If not logged in, nothing to do.
+    return;
+  }
+  const now = Date.now();
+  const channel_ids = Object.entries(channelsToSync)
+    .filter(([id, time]) => id && time > now - CHANNEL_SYNC_KEEP_ALIVE_INTERVAL)
+    .map(([id]) => id);
+  const requestPayload = {
+    changes: [],
+    channel_ids,
+    // Last rev to send to the server is either the earliest change we are still seeking
+    // confirmation on, or the current max_rev that we have synced to the frontend.
+    last_rev: (earliestServerChange && earliestServerChange.server_rev) || user.max_rev,
+  };
+
+  if (lastChange) {
+    const changesMaxRevision = lastChange.rev;
+    const syncableChanges = db[CHANGES_TABLE].where('rev')
+      .belowOrEqual(changesMaxRevision)
+      .filter(c => !c.synced);
+    const changesToSync = await syncableChanges.toArray();
+    // By the time we get here, our changesToSync Array should
+    // have every change we want to sync to the server, so we
+    // can now trim it down to only what is needed to transmit over the wire.
+    // TODO: remove moves when a delete change is present for an object,
+    // because a delete will wipe out the move.
+    const changes = changesToSync.map(trimChangeForSync);
+    // Create a promise for the sync - if there is nothing to sync just resolve immediately,
+    // in order to still call our change cleanup code.
+    if (changes.length) {
+      requestPayload.changes = changes;
+    }
+  }
+  try {
+    // The response from the sync endpoint has the format:
+    // {
+    //   "disallowed": [],
+    //   "allowed": [],
+    //   "changes": [],
+    //   "errors": [],
+    //   "successess": [],
+    // }
+    const response = await client.post(urls['sync'](), requestPayload);
+    try {
+      await Promise.all([
+        handleDisallowed(response),
+        handleAllowed(response),
+        handleReturnedChanges(response),
+        handleErrors(response),
+        handleSuccesses(response),
+        handleMaxRev(response),
+      ]);
+    } catch (err) {
+      console.error('There was an error updating change status', err); // eslint-disable-line no-console
+    }
+  } catch (err) {
+    // There was an error during syncing, log, but carry on
+    console.warn('There was an error during syncing with the backend for', err); // eslint-disable-line no-console
+  }
+  syncActive = false;
 }
 
 const debouncedSyncChanges = debounce(() => {
@@ -319,6 +353,9 @@ async function handleChanges(changes) {
     const mergedSyncableChanges = mergeAllChanges(syncableChanges, true).map(change => {
       // Filter out the rev property as we want that to be assigned during the bulkPut
       const { rev, ...filteredChange } = change; // eslint-disable-line no-unused-vars
+      // Set appropriate contextual information on changes, channel_id and user_id
+      INDEXEDDB_RESOURCES[change.table].setChannelIdOnChange(filteredChange);
+      INDEXEDDB_RESOURCES[change.table].setUserIdOnChange(filteredChange);
       return filteredChange;
     });
 
@@ -332,23 +369,9 @@ async function handleChanges(changes) {
   }
 }
 
-async function checkAndSyncChanges() {
-  // Get count of changes that we care about
-  const changes = await db[CHANGES_TABLE].toCollection()
-    // Only try to sync if we have at least one change that has
-    // not already errored on the backend.
-    .filter(c => !c.errors)
-    .count();
-
-  // If more than 0, sync the changes
-  if (changes > 0) {
-    debouncedSyncChanges();
-  }
-}
-
 async function pollUnsyncedChanges() {
-  await checkAndSyncChanges();
-  unsyncedPollingTimeoutId = setTimeout(() => pollUnsyncedChanges(), SYNC_IF_NO_CHANGES_FOR * 1000);
+  await debouncedSyncChanges();
+  unsyncedPollingTimeoutId = setTimeout(() => pollUnsyncedChanges(), SYNC_INTERVAL * 1000);
 }
 
 function stopPollingUnsyncedChanges() {
@@ -359,6 +382,7 @@ function stopPollingUnsyncedChanges() {
 
 export function startSyncing() {
   startChannelFetchListener();
+  startChannelSyncListener();
   cleanupLocks();
   // Initiate a sync immediately in case any data
   // is left over in the database.
@@ -370,6 +394,7 @@ export function startSyncing() {
 
 export function stopSyncing() {
   stopChannelFetchListener();
+  stopChannelSyncListener();
   debouncedSyncChanges.cancel();
   // Stop pollUnsyncedChanges
   stopPollingUnsyncedChanges();
